@@ -1,0 +1,313 @@
+<!-- templates/index.html -->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WebRTC Audio Mesh — Practice</title>
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 20px; background:#0b1220; color:#e6eef8; }
+    input, button { padding: 8px; margin: 4px; border-radius:6px; }
+    #remoteList { margin-top:10px; }
+    audio { display:block; margin:6px 0; }
+    .bar { width: 120px; height: 12px; background:#1f2937; border-radius:6px; overflow:hidden; display:inline-block; vertical-align: middle; }
+    .bar > .level { height:100%; width:0%; background:#3b82f6; transition: width 0.08s; }
+  </style>
+</head>
+<body>
+  <h2>WebRTC Audio Mesh — Practice</h2>
+
+  <div>
+    <label>Session ID: </label>
+    <input id="sessionInput" placeholder="type or create a session" />
+    <button id="createBtn">Create</button>
+    <button id="joinBtn">Join & Share Mic</button>
+    <label style="margin-left:12px">Name: <input id="nameInput" placeholder="Your name" /></label>
+  </div>
+
+  <div style="margin-top:8px;">
+    <button id="leaveBtn" disabled>Leave</button>
+    <span id="status" style="margin-left:12px">Not connected</span>
+  </div>
+
+  <div style="margin-top:16px;">
+    <strong>Local mic level:</strong>
+    <div class="bar"><div id="localLevel" class="level"></div></div>
+  </div>
+
+  <div id="remoteList">
+    <h4>Remote peers (audio)</h4>
+    <div id="remotes"></div>
+  </div>
+
+<script>
+(async () => {
+  const socket = io();
+  const createBtn = document.getElementById('createBtn');
+  const joinBtn = document.getElementById('joinBtn');
+  const leaveBtn = document.getElementById('leaveBtn');
+  const sessionInput = document.getElementById('sessionInput');
+  const nameInput = document.getElementById('nameInput');
+  const status = document.getElementById('status');
+  const remotes = document.getElementById('remotes');
+  const localLevel = document.getElementById('localLevel');
+
+  const rtcConfig = {
+    iceServers: [
+      { urls: "stun:stun.l.google.com:19302" }
+      // Add TURN servers here for production if needed
+    ]
+  };
+
+  let localStream = null;
+  let audioContext = null, analyser = null, dataArray = null;
+  const pcs = {}; // map remoteSid -> RTCPeerConnection
+
+  // Utility: start local mic and audio meter
+  async function startLocalAudio() {
+    if (localStream) return localStream;
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      alert("Microphone access required: " + e.message);
+      throw e;
+    }
+
+    // create audio meter
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const src = audioContext.createMediaStreamSource(localStream);
+    analyser = audioContext.createAnalyser();
+    analyser.fftSize = 256;
+    const bufferLength = analyser.frequencyBinCount;
+    dataArray = new Uint8Array(bufferLength);
+    src.connect(analyser);
+
+    function update() {
+      analyser.getByteTimeDomainData(dataArray);
+      let sum = 0;
+      for (let i=0;i<bufferLength;i++){
+        let v = (dataArray[i]-128)/128;
+        sum += v*v;
+      }
+      let rms = Math.sqrt(sum / bufferLength);
+      let pct = Math.min(100, rms * 200);
+      localLevel.style.width = pct + "%";
+      requestAnimationFrame(update);
+    }
+    update();
+
+    return localStream;
+  }
+
+  // Create audio element for a remote peer
+  function createRemoteAudioEl(sid) {
+    // container
+    let cont = document.createElement('div');
+    cont.id = "remote_" + sid;
+    // label
+    let label = document.createElement('div');
+    label.textContent = "Peer: " + sid;
+    // audio element
+    let audio = document.createElement('audio');
+    audio.id = "audio_" + sid;
+    audio.autoplay = true;
+    audio.controls = true;
+    // add
+    cont.appendChild(label);
+    cont.appendChild(audio);
+    remotes.appendChild(cont);
+    return audio;
+  }
+
+  function removeRemote(sid) {
+    const el = document.getElementById("remote_" + sid);
+    if (el) el.remove();
+    if (pcs[sid]) {
+      try { pcs[sid].close(); } catch(e) {}
+      delete pcs[sid];
+    }
+  }
+
+  // create RTCPeerConnection and wire events
+  function makePeerConnection(remoteSid) {
+    if (pcs[remoteSid]) return pcs[remoteSid];
+    const pc = new RTCPeerConnection(rtcConfig);
+    pcs[remoteSid] = pc;
+
+    // send ICE candidates to remote
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        socket.emit('ice-candidate', { target: remoteSid, candidate: event.candidate });
+      }
+    };
+
+    // when remote track arrives, attach to audio element
+    pc.ontrack = (ev) => {
+      const el = document.getElementById("audio_" + remoteSid) || createRemoteAudioEl(remoteSid);
+      // Prefer first stream
+      el.srcObject = ev.streams[0];
+      el.play().catch(()=>{/* autoplay policies handled by user gesture */});
+    };
+
+    // connection state change (optional)
+    pc.onconnectionstatechange = () => {
+      console.log("PC state", remoteSid, pc.connectionState);
+    };
+
+    return pc;
+  }
+
+  // UI: create session
+  createBtn.onclick = () => {
+    socket.emit('create_session');
+  };
+
+  socket.on('session_created', (data) => {
+    sessionInput.value = data.session_id;
+    alert("Session created: " + data.session_id);
+  });
+
+  // Join button: get mic, then join server & initiate offers to existing peers
+  joinBtn.onclick = async () => {
+    const session = sessionInput.value.trim();
+    if (!session) return alert("Enter session ID or create one first");
+    try {
+      await startLocalAudio();
+    } catch(e) { return; }
+
+    const name = nameInput.value.trim() || "Anon";
+    socket.emit('join', { session: session, name: name });
+    status.textContent = "Joined session: " + session;
+    joinBtn.disabled = true;
+    leaveBtn.disabled = false;
+    sessionInput.disabled = true;
+    nameInput.disabled = true;
+  };
+
+  // When we receive list of existing peers, create offers to each
+  socket.on('existing_peers', async (data) => {
+    const peers = data.peers || [];
+    console.log("existing peers:", peers);
+    for (const remoteSid of peers) {
+      // create pc, add local tracks, create offer
+      const pc = makePeerConnection(remoteSid);
+      // add local tracks
+      if (localStream) {
+        localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+      }
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.emit('offer', { target: remoteSid, sdp: pc.localDescription });
+      } catch (err) {
+        console.error("Error creating offer to", remoteSid, err);
+      }
+    }
+  });
+
+  // Someone else joined after me (optional: can create offer or wait). We'll wait for them to offer.
+  socket.on('peer_joined', (data) => {
+    console.log("peer joined:", data);
+    // We don't force offer; the joining peer will offer to existing peers (handled above).
+    // Optionally, you could create an offer to them here (double-negotiation must be handled carefully).
+  });
+
+  // Incoming OFFER: set remote desc, add local tracks, create ANSWER
+  socket.on('offer', async (data) => {
+    const from = data.from;
+    const sdp = data.sdp;
+    console.log("Received offer from", from);
+    const pc = makePeerConnection(from);
+    if (localStream) {
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    } else {
+      // if we don't have mic yet, ask user (optional)
+      try {
+        await startLocalAudio();
+        localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+      } catch (e) {
+        console.warn("No local stream; answer will be audio-receive only");
+      }
+    }
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socket.emit('answer', { target: from, sdp: pc.localDescription });
+    } catch (err) {
+      console.error("Error handling offer from", from, err);
+    }
+  });
+
+  // Incoming ANSWER: set remote description
+  socket.on('answer', async (data) => {
+    const from = data.from;
+    const sdp = data.sdp;
+    const pc = pcs[from];
+    if (!pc) {
+      console.warn("Got answer for unknown PC from", from);
+      return;
+    }
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    } catch (err) {
+      console.error("Error setting remote desc (answer) from", from, err);
+    }
+  });
+
+  // Incoming ICE candidate
+  socket.on('ice-candidate', async (data) => {
+    const from = data.from;
+    const candidate = data.candidate;
+    const pc = pcs[from];
+    if (!pc) {
+      console.warn("Got ICE for unknown PC from", from);
+      return;
+    }
+    try {
+      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (err) {
+      console.warn("Error adding ICE candidate", err);
+    }
+  });
+
+  // Peer left -> cleanup
+  socket.on('peer_left', (data) => {
+    const sid = data.sid;
+    console.log("Peer left:", sid);
+    removeRemote(sid);
+  });
+
+  // Leave button: stop local and notify server
+  leaveBtn.onclick = () => {
+    const session = sessionInput.value.trim();
+    if (session) {
+      socket.emit('leave', { session: session });
+    }
+    // cleanup local
+    if (localStream) {
+      localStream.getTracks().forEach(t => t.stop());
+      localStream = null;
+    }
+    if (audioContext) {
+      try { audioContext.close(); } catch(e) {}
+      audioContext = null;
+    }
+    // close all peer connections
+    for (const sid in pcs) {
+      try { pcs[sid].close(); } catch(e) {}
+      const el = document.getElementById("audio_" + sid);
+      if (el) el.remove();
+    }
+    Object.keys(pcs).forEach(k => delete pcs[k]);
+    status.textContent = "Left";
+    joinBtn.disabled = false;
+    leaveBtn.disabled = true;
+    sessionInput.disabled = false;
+    nameInput.disabled = false;
+  };
+
+})();
+</script>
+</body>
+</html>
