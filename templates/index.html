@@ -52,12 +52,28 @@
   const remotes = document.getElementById('remotes');
   const localLevel = document.getElementById('localLevel');
 
-  const rtcConfig = {
-    iceServers: [
-      { urls: "stun:stun.l.google.com:19302" }
-      // Add TURN servers here for production if needed
-    ]
-  };
+  // 🔹 Fetch ICE servers from Xirsys dynamically
+  async function getIceServers() {
+    try {
+      const res = await fetch("https://Rishibije:a5e58be6-9d1d-11f0-b2e0-0242ac140002@global.xirsys.net/_turn/MyFirstApp", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ format: "urls" })
+      });
+      const data = await res.json();
+      if (data && data.v && data.v.iceServers) {
+        console.log("ICE servers from Xirsys:", data.v.iceServers);
+        return data.v.iceServers;
+      }
+    } catch (err) {
+      console.error("Failed to fetch ICE servers", err);
+    }
+    // fallback
+    return [{ urls: "stun:stun.l.google.com:19302" }];
+  }
+
+  const iceServers = await getIceServers();
+  const rtcConfig = { iceServers };
 
   let localStream = null;
   let audioContext = null, analyser = null, dataArray = null;
@@ -101,18 +117,14 @@
 
   // Create audio element for a remote peer
   function createRemoteAudioEl(sid) {
-    // container
     let cont = document.createElement('div');
     cont.id = "remote_" + sid;
-    // label
     let label = document.createElement('div');
     label.textContent = "Peer: " + sid;
-    // audio element
     let audio = document.createElement('audio');
     audio.id = "audio_" + sid;
     audio.autoplay = true;
     audio.controls = true;
-    // add
     cont.appendChild(label);
     cont.appendChild(audio);
     remotes.appendChild(cont);
@@ -128,28 +140,23 @@
     }
   }
 
-  // create RTCPeerConnection and wire events
   function makePeerConnection(remoteSid) {
     if (pcs[remoteSid]) return pcs[remoteSid];
     const pc = new RTCPeerConnection(rtcConfig);
     pcs[remoteSid] = pc;
 
-    // send ICE candidates to remote
     pc.onicecandidate = (event) => {
       if (event.candidate) {
         socket.emit('ice-candidate', { target: remoteSid, candidate: event.candidate });
       }
     };
 
-    // when remote track arrives, attach to audio element
     pc.ontrack = (ev) => {
       const el = document.getElementById("audio_" + remoteSid) || createRemoteAudioEl(remoteSid);
-      // Prefer first stream
       el.srcObject = ev.streams[0];
-      el.play().catch(()=>{/* autoplay policies handled by user gesture */});
+      el.play().catch(()=>{});
     };
 
-    // connection state change (optional)
     pc.onconnectionstatechange = () => {
       console.log("PC state", remoteSid, pc.connectionState);
     };
@@ -157,7 +164,6 @@
     return pc;
   }
 
-  // UI: create session
   createBtn.onclick = () => {
     socket.emit('create_session');
   };
@@ -167,7 +173,6 @@
     alert("Session created: " + data.session_id);
   });
 
-  // Join button: get mic, then join server & initiate offers to existing peers
   joinBtn.onclick = async () => {
     const session = sessionInput.value.trim();
     if (!session) return alert("Enter session ID or create one first");
@@ -184,14 +189,11 @@
     nameInput.disabled = true;
   };
 
-  // When we receive list of existing peers, create offers to each
   socket.on('existing_peers', async (data) => {
     const peers = data.peers || [];
     console.log("existing peers:", peers);
     for (const remoteSid of peers) {
-      // create pc, add local tracks, create offer
       const pc = makePeerConnection(remoteSid);
-      // add local tracks
       if (localStream) {
         localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
       }
@@ -205,14 +207,10 @@
     }
   });
 
-  // Someone else joined after me (optional: can create offer or wait). We'll wait for them to offer.
   socket.on('peer_joined', (data) => {
     console.log("peer joined:", data);
-    // We don't force offer; the joining peer will offer to existing peers (handled above).
-    // Optionally, you could create an offer to them here (double-negotiation must be handled carefully).
   });
 
-  // Incoming OFFER: set remote desc, add local tracks, create ANSWER
   socket.on('offer', async (data) => {
     const from = data.from;
     const sdp = data.sdp;
@@ -221,7 +219,6 @@
     if (localStream) {
       localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
     } else {
-      // if we don't have mic yet, ask user (optional)
       try {
         await startLocalAudio();
         localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
@@ -239,7 +236,6 @@
     }
   });
 
-  // Incoming ANSWER: set remote description
   socket.on('answer', async (data) => {
     const from = data.from;
     const sdp = data.sdp;
@@ -255,7 +251,6 @@
     }
   });
 
-  // Incoming ICE candidate
   socket.on('ice-candidate', async (data) => {
     const from = data.from;
     const candidate = data.candidate;
@@ -271,20 +266,17 @@
     }
   });
 
-  // Peer left -> cleanup
   socket.on('peer_left', (data) => {
     const sid = data.sid;
     console.log("Peer left:", sid);
     removeRemote(sid);
   });
 
-  // Leave button: stop local and notify server
   leaveBtn.onclick = () => {
     const session = sessionInput.value.trim();
     if (session) {
       socket.emit('leave', { session: session });
     }
-    // cleanup local
     if (localStream) {
       localStream.getTracks().forEach(t => t.stop());
       localStream = null;
@@ -293,7 +285,6 @@
       try { audioContext.close(); } catch(e) {}
       audioContext = null;
     }
-    // close all peer connections
     for (const sid in pcs) {
       try { pcs[sid].close(); } catch(e) {}
       const el = document.getElementById("audio_" + sid);
